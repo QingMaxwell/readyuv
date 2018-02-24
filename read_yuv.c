@@ -15,6 +15,7 @@
 #define FMT_YUV422I 2
 #define FMT_YUV420P 3
 #define FMT_YUV420SP 4
+#define FMT_RGBI_FP16 17
 
 #define MODE_1 1
 
@@ -22,6 +23,7 @@ int CIF_WIDTH = 0;
 int CIF_HEIGHT = 0;
 int CIF_FRAME_SIZE = 0;
 int CIF_FORMAT = FMT_YUV422P;
+int CIF_DEC_MODE = 0;
 
 #define SHOW_PLAN_TYTLE
 #define SHOW_LINE_NUM
@@ -56,7 +58,7 @@ typedef struct {
     int highlight_pos_x;
     int highlight_pos_y;
 	char tytle[PLAN_TYTLE_LENGTH+1];
-	char *data;
+	unsigned int *data;
 } PLAN_WINDOW;
 
 typedef struct {
@@ -76,38 +78,205 @@ typedef struct {
 	unsigned int inter;
 	int x_ds;
 	int y_ds;
+    unsigned int sample;
 } FRAME_PLAN;
 
 WINDOW_CONFIG winCfg;
 FRAME_PLAN frame[MAX_PLAN];
 
-unsigned char read_pos(FRAME_PLAN *frame, int x, int y)
+
+//#####################################################################################################
+
+#define MOVIDIUS_FP32
+#define F32_EX_INEXACT     0x00000001//0x00000020
+#define F32_EX_DIV_BY_ZERO 0x00000002//0x00000004
+#define F32_EX_INVALID     0x00000004//0x00000001
+#define F32_EX_UNDERFLOW   0x00000008//0x00000010
+#define F32_EX_OVERFLOW    0x00000010//0x00000008
+
+#define EXTRACT_F16_SIGN(x)   ((x >> 15) & 0x1)
+#define EXTRACT_F16_EXP(x)    ((x >> 10) & 0x1F)
+#define EXTRACT_F16_FRAC(x)   (x & 0x000003FF)
+
+#define F16_IS_SNAN(x)      (((x & 0x7E00) == 0x7C00)&&((x & 0x1FF)> 0))
+#define PACK_F32(x, y, z)     ((x << 31) + (y << 23) + z)
+
+
+typedef union
+{
+    unsigned int u32;
+    float f32;
+}u32f32;
+
+unsigned int exceptionsReg;
+unsigned int* exceptions = &exceptionsReg;
+
+unsigned int f16_shift_left(unsigned int op, unsigned int cnt)
+{
+    unsigned int result;
+    if (cnt == 0)
+    {
+        result = op;
+    }
+    else if (cnt < 32)
+    {
+        result = (op << cnt);
+    }
+    else 
+    {
+        result = 0;
+    }
+    return result;
+}
+
+float f16Tof32(unsigned int x)
+{
+    unsigned int sign;
+    int exp;
+    unsigned int frac;
+    unsigned int result;
+    u32f32       u;
+
+    frac = EXTRACT_F16_FRAC(x);
+    exp  = EXTRACT_F16_EXP(x);
+    sign = EXTRACT_F16_SIGN(x);
+    if (exp == 0x1F) 
+    {
+        if (frac != 0)
+        {
+            // NaN
+            if (F16_IS_SNAN(x))
+            {
+                *exceptions |= F32_EX_INVALID;
+            }
+            result = 0;
+            //Get rid of exponent and sign
+#ifndef MOVIDIUS_FP32
+            result = x << 22;
+            result = f32_shift_right(result, 9);
+            result |= ((sign << 31) | 0x7F800000);
+#else
+            result |= ((sign << 31) | 0x7FC00000);
+#endif
+        }
+        else
+        {
+            //infinity
+            result = PACK_F32(sign, 0xFF, 0);
+        }
+    }
+    else if (exp == 0)
+    {
+        //either denormal or zero
+        if (frac == 0)
+        {
+            //zero
+            result = PACK_F32(sign, 0, 0);
+        }
+        else
+        {
+            //subnormal
+#ifndef MOVIDIUS_FP32
+            f16_normalize_subnormal(&frac, &exp);
+            exp--;
+            // ALDo: is the value 13 ok??
+            result = f16_shift_left(frac, 13);
+            // exp = exp + 127 - 15 = exp + 112
+            result = PACK_F32(sign, (exp + 0x70), result);
+#else
+            result = PACK_F32(sign, 0, 0);
+#endif
+        }
+    }
+    else
+    {
+        // ALDo: is the value 13 ok??
+        result = f16_shift_left(frac, 13);
+        result = PACK_F32(sign, (exp + 0x70), result);
+    }
+    
+    u.u32 = result;
+    return u.f32; //andreil
+}
+
+
+unsigned int read_pos(FRAME_PLAN *frame, int x, int y)
 {
 	unsigned char *buf = frame->buf;
 	int w = frame->w;
 	int h = frame->h;
 	int pitch = frame->pitch;
 	int inter = frame->inter;
-	
-	if (x < w && y < h)
-	{
-		return buf[pitch*y+x*inter];
-	}
-	else
-	{
-		return 0xff;
-	}
+    unsigned int sample = frame ->sample & 0xffff;
+    int isFp = (frame->sample >> 16) & 1;
+    if (sample == 8)
+    {
+    	if (x < w && y < h)
+    		return buf[pitch*y+x*inter];
+        else
+    	    return 0xff;
+    }
+    else if (sample == 16)
+    {
+        if (x < w && y < h) {
+            unsigned short *_p = (unsigned short *)(&buf[pitch*y+x*inter]);
+            if (isFp)
+                return (unsigned int)f16Tof32(*_p);
+            else
+                return *_p;
+        }
+        else
+            return 0xffff;
+    }
+    else if (sample == 32)
+    {
+        if (x < w && y < h)
+            return *((unsigned int *)(&buf[pitch*y+x*inter]));
+        else
+            return 0xffffffff;
+    }
+    return 0xffffffff;
 }
+
+unsigned short read_pos_16bit(FRAME_PLAN *frame, int x, int y)
+{
+	unsigned char *buf = frame->buf;
+    unsigned short *buf16;
+	int w = frame->w;
+	int h = frame->h;
+	int pitch = frame->pitch;
+	int inter = frame->inter;
+	if (x < w && y < h) {
+        buf16 = (unsigned short *)&buf[pitch*y+x*inter];
+		return *buf16;
+	}
+	return 0xffff;
+}
+
 
 int get_plan_data_offset_x(int x_idx, int end)
 {
-    if (end)
+    if (CIF_DEC_MODE)
     {
-        return (x_idx + 1) * 3 + ((x_idx >> 3) * H_BLANK);
+        if (end)
+        {
+            return (x_idx + 1) * 4 + ((x_idx >> 4) * H_BLANK);
+        }
+        else
+        {
+            return x_idx * 4 + ((x_idx >> 4) * H_BLANK);
+        }
     }
     else
     {
-        return x_idx * 3 + ((x_idx >> 3) * H_BLANK);
+        if (end)
+        {
+            return (x_idx + 1) * 4 + ((x_idx >> 4) * H_BLANK);
+        }
+        else
+        {
+            return x_idx * 4 + ((x_idx >> 4) * H_BLANK);
+        }
     }
 }
 
@@ -286,7 +455,14 @@ void RDWIN_DrawPlannData(PLAN_WINDOW *window)
 	for (y = 0; y < window->data_h; y++) {
 		for (x = 0; x < window->data_w; x++) {
 			byte = window->data[y * window->data_w + x];
-			sprintf(hexstr, "%02x", byte);
+            if (CIF_DEC_MODE)
+            {
+                sprintf(hexstr, "%-3d", byte);
+            }
+            else
+            {
+			    sprintf(hexstr, "%02x", byte);
+            }
 			move(window->data_y+get_plan_data_offset_y(y, 0), window->data_x+get_plan_data_offset_x(x, 0));
             if (window->highlight_pos_x == x && window->highlight_pos_y == y)
                 standout();
@@ -443,7 +619,7 @@ int RDWIN_Init(int mode)
         winCfg.plann[i].hideLeft = hideLeft[i];
 		winCfg.plann[i].data_w = w_list[i];
 		winCfg.plann[i].data_h = h_list[i];
-        winCfg.plann[i].data = malloc(w_list[i] * h_list[i]);
+        winCfg.plann[i].data = malloc(w_list[i] * h_list[i] * sizeof(winCfg.plann[i].data[0]));
         if (NULL == winCfg.plann[i].data)
         {
             return ERR_MEM_ALLOC_FAILED;
@@ -615,8 +791,9 @@ void show_help()
 {
 	printf("Usage: read_yuv [OPTION...] [FILE]\n");
 	printf("Options:\n");
+    printf("    -d           dec mode\n");
 	printf("    -s size      set frame size (WxH)\n");
-	printf("    -f format    set frame format (422p|422i|420p|420sp)\n");
+	printf("    -f format    set frame format (422p|422i|420p|420sp|rgbifp16)\n");
 	printf("Examples:\n");
 	printf("    read_yuv -s 1920x1080 -f 422p input.yuv\n");
 }
@@ -645,10 +822,13 @@ int main(int argc, char *argv[])
 	}
 	
 	opterr = 0;
-	while((result = getopt(argc, argv, "s:f:")) != -1)
+	while((result = getopt(argc, argv, "s:f:d")) != -1)
 	{
 		switch(result)
 		{
+            case 'd':
+                CIF_DEC_MODE = 1;
+                break;
 			case 's':
 				sscanf(optarg, "%dx%d", &CIF_WIDTH, &CIF_HEIGHT);
 				break;
@@ -669,6 +849,10 @@ int main(int argc, char *argv[])
 				{
 					CIF_FORMAT = FMT_YUV420SP;
 				}
+                else if (!strcmp(optarg,"rgbifp16"))
+                {
+                    CIF_FORMAT = FMT_RGBI_FP16;
+                }
 				else
 				{
 					err = ERR_UNKNOWN_FORMAT;
@@ -694,6 +878,10 @@ int main(int argc, char *argv[])
 	{
 		CIF_FRAME_SIZE = CIF_WIDTH * CIF_HEIGHT * 3 / 2;
 	}
+    else if (FMT_RGBI_FP16 == CIF_FORMAT)
+    {
+        CIF_FRAME_SIZE = CIF_WIDTH * CIF_HEIGHT * 3 * 2;
+    }
 	
 	pf = fopen(fname, "rb");
 	if (NULL == pf)
@@ -736,6 +924,7 @@ int main(int argc, char *argv[])
 			frame[i].inter = i == 0 ? 2 : 4;
 			frame[i].x_ds = i == 0 ? 0 : 1;
 			frame[i].y_ds = 0;
+            frame[i].sample = 8;
 		}
 	}
 	else if (CIF_FORMAT == FMT_YUV422P)
@@ -749,6 +938,7 @@ int main(int argc, char *argv[])
 			frame[i].inter = 1;
 			frame[i].x_ds = i == 0 ? 0 : 1;
 			frame[i].y_ds = 0;
+            frame[i].sample = 8;
 		}
 	}
 	else if (CIF_FORMAT == FMT_YUV420P)
@@ -762,6 +952,7 @@ int main(int argc, char *argv[])
 			frame[i].inter = 1;
 			frame[i].x_ds = i == 0 ? 0 : 1;
 			frame[i].y_ds = i == 0 ? 0 : 1;
+            frame[i].sample = 8;
 		}
 	}
 	else if (CIF_FORMAT == FMT_YUV420SP)
@@ -775,8 +966,23 @@ int main(int argc, char *argv[])
 			frame[i].inter = i == 0 ? 1 : 2;
 			frame[i].x_ds = i == 0 ? 0 : 1;
 			frame[i].y_ds = i == 0 ? 0 : 1;
+            frame[i].sample = 8;
 		}
 	}
+    else if (CIF_FORMAT == FMT_RGBI_FP16)
+    {
+        for (i = 0; i < MAX_PLAN; i++)
+		{
+			frame[i].buf = i == 0 ? pbuf : i == 1 ? pbuf + 2 : pbuf + 4;
+			frame[i].w = CIF_WIDTH;
+			frame[i].h = CIF_HEIGHT;
+			frame[i].pitch = CIF_WIDTH * 3 * 2;
+			frame[i].inter = 6;
+			frame[i].x_ds = 0;
+			frame[i].y_ds = 0;
+            frame[i].sample = 0x10000 | 16;
+		}
+    }
 	
 	err = RDWIN_Init(MODE_1);
     if (err)
