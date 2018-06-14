@@ -4,6 +4,7 @@
 #include <curses.h>
 #include <time.h>
 #include <unistd.h>
+#include "format.h"
 
 #define ERR_FILE_OPEN_FAILED   -1
 #define ERR_FILE_SIZE_MISMATCH -2
@@ -11,19 +12,9 @@
 #define ERR_MEM_ALLOC_FAILED   -4
 #define ERR_UNKNOWN_FORMAT     -5
 
-#define FMT_YUV422P 1
-#define FMT_YUV422I 2
-#define FMT_YUV420P 3
-#define FMT_YUV420SP 4
-#define FMT_RGBI_FP16 17
-
 #define MODE_1 1
 
-int CIF_WIDTH = 0;
-int CIF_HEIGHT = 0;
-int CIF_FRAME_SIZE = 0;
-int CIF_FORMAT = FMT_YUV422P;
-int CIF_DEC_MODE = 0;
+
 
 #define SHOW_PLAN_TYTLE
 #define SHOW_LINE_NUM
@@ -70,188 +61,19 @@ typedef struct {
 	PLAN_WINDOW plann[MAX_PLAN];
 } WINDOW_CONFIG;
 
-typedef struct {
-	unsigned char *buf;
-	unsigned int w;
-	unsigned int h;
-	unsigned int pitch;
-	unsigned int inter;
-	int x_ds;
-	int y_ds;
-    unsigned int sample;
-} FRAME_PLAN;
+/* input param */
+int CIF_WIDTH = 0;
+int CIF_HEIGHT = 0;
+int CIF_FORMAT = FMT_YUV422P;
+int CIF_DEC_MODE = 0;
+int CIF_OUTPUT = 0;
+char CIF_OUTPUT_FILE_NAME[1024];
+int CIF_OUTPUT_SINGLE_PLAN = 0;
+int CIF_OUTPUT_PLAN = 0;
 
 WINDOW_CONFIG winCfg;
-FRAME_PLAN frame[MAX_PLAN];
+FRAME_INFO frameInfo;
 
-
-//#####################################################################################################
-
-#define MOVIDIUS_FP32
-#define F32_EX_INEXACT     0x00000001//0x00000020
-#define F32_EX_DIV_BY_ZERO 0x00000002//0x00000004
-#define F32_EX_INVALID     0x00000004//0x00000001
-#define F32_EX_UNDERFLOW   0x00000008//0x00000010
-#define F32_EX_OVERFLOW    0x00000010//0x00000008
-
-#define EXTRACT_F16_SIGN(x)   ((x >> 15) & 0x1)
-#define EXTRACT_F16_EXP(x)    ((x >> 10) & 0x1F)
-#define EXTRACT_F16_FRAC(x)   (x & 0x000003FF)
-
-#define F16_IS_SNAN(x)      (((x & 0x7E00) == 0x7C00)&&((x & 0x1FF)> 0))
-#define PACK_F32(x, y, z)     ((x << 31) + (y << 23) + z)
-
-
-typedef union
-{
-    unsigned int u32;
-    float f32;
-}u32f32;
-
-unsigned int exceptionsReg;
-unsigned int* exceptions = &exceptionsReg;
-
-unsigned int f16_shift_left(unsigned int op, unsigned int cnt)
-{
-    unsigned int result;
-    if (cnt == 0)
-    {
-        result = op;
-    }
-    else if (cnt < 32)
-    {
-        result = (op << cnt);
-    }
-    else 
-    {
-        result = 0;
-    }
-    return result;
-}
-
-float f16Tof32(unsigned int x)
-{
-    unsigned int sign;
-    int exp;
-    unsigned int frac;
-    unsigned int result;
-    u32f32       u;
-
-    frac = EXTRACT_F16_FRAC(x);
-    exp  = EXTRACT_F16_EXP(x);
-    sign = EXTRACT_F16_SIGN(x);
-    if (exp == 0x1F) 
-    {
-        if (frac != 0)
-        {
-            // NaN
-            if (F16_IS_SNAN(x))
-            {
-                *exceptions |= F32_EX_INVALID;
-            }
-            result = 0;
-            //Get rid of exponent and sign
-#ifndef MOVIDIUS_FP32
-            result = x << 22;
-            result = f32_shift_right(result, 9);
-            result |= ((sign << 31) | 0x7F800000);
-#else
-            result |= ((sign << 31) | 0x7FC00000);
-#endif
-        }
-        else
-        {
-            //infinity
-            result = PACK_F32(sign, 0xFF, 0);
-        }
-    }
-    else if (exp == 0)
-    {
-        //either denormal or zero
-        if (frac == 0)
-        {
-            //zero
-            result = PACK_F32(sign, 0, 0);
-        }
-        else
-        {
-            //subnormal
-#ifndef MOVIDIUS_FP32
-            f16_normalize_subnormal(&frac, &exp);
-            exp--;
-            // ALDo: is the value 13 ok??
-            result = f16_shift_left(frac, 13);
-            // exp = exp + 127 - 15 = exp + 112
-            result = PACK_F32(sign, (exp + 0x70), result);
-#else
-            result = PACK_F32(sign, 0, 0);
-#endif
-        }
-    }
-    else
-    {
-        // ALDo: is the value 13 ok??
-        result = f16_shift_left(frac, 13);
-        result = PACK_F32(sign, (exp + 0x70), result);
-    }
-    
-    u.u32 = result;
-    return u.f32; //andreil
-}
-
-
-unsigned int read_pos(FRAME_PLAN *frame, int x, int y)
-{
-	unsigned char *buf = frame->buf;
-	int w = frame->w;
-	int h = frame->h;
-	int pitch = frame->pitch;
-	int inter = frame->inter;
-    unsigned int sample = frame ->sample & 0xffff;
-    int isFp = (frame->sample >> 16) & 1;
-    if (sample == 8)
-    {
-    	if (x < w && y < h)
-    		return buf[pitch*y+x*inter];
-        else
-    	    return 0xff;
-    }
-    else if (sample == 16)
-    {
-        if (x < w && y < h) {
-            unsigned short *_p = (unsigned short *)(&buf[pitch*y+x*inter]);
-            if (isFp)
-                return (unsigned int)f16Tof32(*_p);
-            else
-                return *_p;
-        }
-        else
-            return 0xffff;
-    }
-    else if (sample == 32)
-    {
-        if (x < w && y < h)
-            return *((unsigned int *)(&buf[pitch*y+x*inter]));
-        else
-            return 0xffffffff;
-    }
-    return 0xffffffff;
-}
-
-unsigned short read_pos_16bit(FRAME_PLAN *frame, int x, int y)
-{
-	unsigned char *buf = frame->buf;
-    unsigned short *buf16;
-	int w = frame->w;
-	int h = frame->h;
-	int pitch = frame->pitch;
-	int inter = frame->inter;
-	if (x < w && y < h) {
-        buf16 = (unsigned short *)&buf[pitch*y+x*inter];
-		return *buf16;
-	}
-	return 0xffff;
-}
 
 
 int get_plan_data_offset_x(int x_idx, int end)
@@ -628,8 +450,8 @@ int RDWIN_Init(int mode)
         winCfg.plann[i].highlight_pos_y = 0;
 		winCfg.plann[i].read_x = 0;
 		winCfg.plann[i].read_y = 0;
-		winCfg.plann[i].plan_w = frame[i].x_ds ? CIF_WIDTH / 2 : CIF_WIDTH;
-		winCfg.plann[i].plan_h = frame[i].y_ds ? CIF_HEIGHT / 2 : CIF_HEIGHT;
+		winCfg.plann[i].plan_w = frameInfo.plane[i].w;
+		winCfg.plann[i].plan_h = frameInfo.plane[i].h;
 		winCfg.plann[i].w = get_plan_w(winCfg.plann[i].data_w,
                                 winCfg.plann[i].showLineNum,
                                 winCfg.plann[i].showTytle,
@@ -686,8 +508,8 @@ void RDWIN_Update(int x, int y)
     
     for (i = 0; i < MAX_PLAN; i++)
     {
-        _x = frame[i].x_ds ? x / 2 : x;
-		_y = frame[i].y_ds ? y / 2 : y;
+        _x = frameInfo.plane[i].x_ds ? x / 2 : x;
+		_y = frameInfo.plane[i].y_ds ? y / 2 : y;
         if (_x < winCfg.plann[i].read_x + winCfg.plann[i].data_w
             && _x >= winCfg.plann[i].read_x)
         {
@@ -770,7 +592,7 @@ void RDWIN_Update(int x, int y)
         }
         
         RDWIN_ReadPlannData(&winCfg.plann[i],
-                        &frame[i],
+                        &frameInfo.plane[i],
                         winCfg.plann[i].read_x,
                         winCfg.plann[i].read_y);
         RDWIN_DrawPlannData(&winCfg.plann[i]);
@@ -793,9 +615,190 @@ void show_help()
 	printf("Options:\n");
     printf("    -d           dec mode\n");
 	printf("    -s size      set frame size (WxH)\n");
-	printf("    -f format    set frame format (422p|422i|420p|420sp|rgbifp16)\n");
+	printf("    -f format    set frame format (%s)\n", fmt_get_supported('|'));
+    printf("    -o bmp file  dump bmp file\n");
+    printf("    -p plann     dump single plann\n");
 	printf("Examples:\n");
 	printf("    read_yuv -s 1920x1080 -f 422p input.yuv\n");
+}
+
+int dump(void)
+{
+#define clip(x) ((x) > 255 ? 255 : (x) < 0 ? 0 : (x))
+
+    /******************************************************
+     * BT.601定义
+     ******************************************************/
+    //R = clip(1.164 * (Y-16) + 1.596 * (V-128));
+    //G = clip(1.164 * (Y-16) - 0.813 * (V-128) - 0.392 * (U-128));
+    //B = clip(1.164 * (Y-16) + 2.017 * (U-128));
+#define YUV_TO_RGB(Y, U, V, R, G, B) \
+    { \
+        R = clip((298 * (Y-16) + 409 * (V-128) + 128) >> 8); \
+        G = clip((298 * (Y-16) - 100 * (U-128) - 208 * (V-128) + 128) >> 8); \
+        B = clip((298 * (Y-16) + 516 * (U-128) + 128) >> 8); \
+    }
+
+    int bitlen = 24;
+    FRAME_INFO *frame = &frameInfo;
+
+    unsigned char lut[4];
+    unsigned char hdr0[] = {0x42, 0x4d};
+    struct {
+        unsigned int bfSize;      ///< 用字节表示的整个文件大小
+        unsigned int bfReserved;  ///< 保留，一般设置为0
+        unsigned int bfOffBits;   ///< 位图数据偏移
+        unsigned int biSize;      ///< 位图信息头的大小，通常是28H
+        unsigned int biWidth;     ///< 位图像素宽度
+        unsigned int biHeight;    ///< 位图像素高度
+        unsigned short biPlanes;    ///< 位图的位面数，总是1
+        unsigned short biBitCount;  ///< 像素位宽
+        unsigned int biCompression;   ///< 压缩说明
+        unsigned int biSizeImage;     ///< 位图数据的大小，4字节的倍数
+        unsigned int biXPelsPerMeter; ///< 用象素/米表示的水平分辨率，默认0x0EC4
+        unsigned int biYPelsPerMeter; ///< 用象素/米表示的垂直分辨率，默认0x0EC4
+        unsigned int biClrUsed;       ///< 位图使用的颜色数
+        unsigned int biClrImportant;  ///< 重要的颜色数
+    } hdr1;
+    
+    int line_size = 0;
+    int data_size = 0;
+    int lut_size = 0;
+    int total_size = 0;
+    unsigned char *pline = NULL;
+    int i,j,x,y,p;
+    unsigned char data[3];
+    unsigned char tmp[3];
+    int pid = 0;
+    
+    if (CIF_OUTPUT_SINGLE_PLAN)
+    {
+        pid = CIF_OUTPUT_PLAN;
+        if (pid >= frame->plane_num || pid < 0)
+        {
+            printf("invalid plan id\n");
+            return ERR_UNKNOWN_FORMAT;
+        }
+        bitlen = 8;
+    }
+
+    if (bitlen == 24)
+    {
+        line_size = (frame->w*3 + 3) & (~3);
+        lut_size = 0;
+    }
+    else if (bitlen == 8)
+    {
+        line_size = (frame->w + 3) & (~3);
+        lut_size = 256 * 4;
+    }
+    else
+    {
+        printf("wrong bitlen\n");
+        return ERR_UNKNOWN_FORMAT;
+    }
+    data_size = line_size * frame->h;
+    total_size = sizeof(hdr0) + sizeof(hdr1) + lut_size + data_size;
+
+    hdr1.bfSize = total_size;
+    hdr1.bfReserved = 0;
+    hdr1.bfOffBits = sizeof(hdr0) + sizeof(hdr1) + lut_size;
+    hdr1.biSize = 40;
+    hdr1.biWidth = frame->w;
+    hdr1.biHeight = frame->h;
+    hdr1.biPlanes = 1;
+    hdr1.biBitCount = bitlen;
+    hdr1.biCompression = 0;
+    hdr1.biSizeImage = data_size;
+    hdr1.biXPelsPerMeter = 0x0EC4;
+    hdr1.biYPelsPerMeter = 0x0EC4;
+    hdr1.biClrUsed = 0;
+    hdr1.biClrImportant = 0;
+
+    
+    pline = malloc(line_size);
+    
+    if (NULL == pline)
+    {
+        printf("malloc pline failed\n");
+        return ERR_MEM_ALLOC_FAILED;
+    }
+    FILE *fout = fopen(CIF_OUTPUT_FILE_NAME, "wb");
+    if (NULL == fout)
+    {
+        printf("open output file %s failed\n", CIF_OUTPUT_FILE_NAME);
+        free(pline);
+        return ERR_FILE_OPEN_FAILED;
+    }
+
+    fwrite(hdr0, 1, sizeof(hdr0), fout);
+    fwrite(&hdr1, 1, sizeof(hdr1), fout);
+
+    if (bitlen == 8)
+    {
+        /* lut */
+        for (i = 0; i < 256; i++)
+        {
+            lut[0] = i;
+            lut[1] = i;
+            lut[2] = i;
+            lut[3] = 0;
+            fwrite(lut, 1, sizeof(lut), fout);
+        }
+        for (i = 0; i < frame->h; i++)
+        {
+            for (j = 0; j < frame->w; j++)
+            {
+                x = j / (frame->plane[pid].x_ds + 1);
+                y = (frame->h-1-i) / (frame->plane[pid].y_ds + 1);
+                pline[j] = read_pos(&frame->plane[pid], x, y);
+            }
+            fwrite(pline, 1, line_size, fout);
+        }
+    }
+    else
+    {
+        if (CS_RGB == frame->cs || CS_YUV == frame->cs)
+        {
+            for (i = 0; i < frame->h; i++)
+            {
+                for (j = 0; j < frame->w; j++)
+                {
+                    for (p = 0; p < 3; p++)
+                    {
+                        x = j / (frame->plane[p].x_ds + 1);
+                        y = (frame->h-1-i) / (frame->plane[p].y_ds + 1);
+                        data[p] = read_pos(&frame->plane[p], x, y);
+                    }
+                    if (CS_RGB == frame->cs)
+                    {
+                        pline[j*3] = data[2];
+                        pline[j*3+1] = data[1];
+                        pline[j*3+2] = data[0];
+                    }
+                    else
+                    {
+                        YUV_TO_RGB(data[0], data[1], data[2],
+                            tmp[0], tmp[1], tmp[2]);
+                        pline[j*3] = tmp[2];
+                        pline[j*3+1] = tmp[1];
+                        pline[j*3+2] = tmp[0];
+                    }
+                }
+                fwrite(pline, 1, line_size, fout);
+            }
+        }
+        else
+        {
+            free(pline);
+            fclose(fout);
+            return ERR_UNKNOWN_FORMAT;
+        }
+    } 
+
+    free(pline);
+    fclose(fout);
+    return 0;
 }
 
 int main(int argc, char *argv[])
@@ -812,6 +815,7 @@ int main(int argc, char *argv[])
 	FILE *pf = NULL;
 	unsigned int file_size = 0;
 	unsigned char *pbuf = NULL;
+    int buf_size = 0;
 	int old_lines = 0;
 	int old_cols = 0;
 	
@@ -822,7 +826,7 @@ int main(int argc, char *argv[])
 	}
 	
 	opterr = 0;
-	while((result = getopt(argc, argv, "s:f:d")) != -1)
+	while((result = getopt(argc, argv, "s:f:o:p:d")) != -1)
 	{
 		switch(result)
 		{
@@ -833,31 +837,20 @@ int main(int argc, char *argv[])
 				sscanf(optarg, "%dx%d", &CIF_WIDTH, &CIF_HEIGHT);
 				break;
 			case 'f':
-				if (!strcmp(optarg,"422p"))
-				{
-					CIF_FORMAT = FMT_YUV422P;
-				}
-				else if (!strcmp(optarg,"422i"))
-				{
-					CIF_FORMAT = FMT_YUV422I;
-				}
-				else if (!strcmp(optarg,"420p"))
-				{
-					CIF_FORMAT = FMT_YUV420P;
-				}
-				else if (!strcmp(optarg,"420sp"))
-				{
-					CIF_FORMAT = FMT_YUV420SP;
-				}
-                else if (!strcmp(optarg,"rgbifp16"))
-                {
-                    CIF_FORMAT = FMT_RGBI_FP16;
-                }
-				else
+                CIF_FORMAT = fmt_from_string(optarg);
+				if (FMT_MAX == CIF_FORMAT)
 				{
 					err = ERR_UNKNOWN_FORMAT;
 				}
 				break;
+            case 'o':
+                CIF_OUTPUT = 1;
+                strncpy(CIF_OUTPUT_FILE_NAME, optarg, sizeof(CIF_OUTPUT_FILE_NAME)-1);
+                break;
+            case 'p':
+                CIF_OUTPUT_SINGLE_PLAN = 1;
+                CIF_OUTPUT_PLAN = atoi(optarg);
+                break;
 			default:
 				break;
 		}
@@ -869,18 +862,12 @@ int main(int argc, char *argv[])
 		show_help();
 		return 0;
 	}
-	
-	if (FMT_YUV422P == CIF_FORMAT || FMT_YUV422I == CIF_FORMAT)	
-	{
-		CIF_FRAME_SIZE = CIF_WIDTH * CIF_HEIGHT * 2;
-	}
-	else if (FMT_YUV420P == CIF_FORMAT || FMT_YUV420SP == CIF_FORMAT)
-	{
-		CIF_FRAME_SIZE = CIF_WIDTH * CIF_HEIGHT * 3 / 2;
-	}
-    else if (FMT_RGBI_FP16 == CIF_FORMAT)
+
+    buf_size = fmt_get_frame_size(CIF_FORMAT, CIF_WIDTH, CIF_HEIGHT);
+    if (buf_size <= 0)
     {
-        CIF_FRAME_SIZE = CIF_WIDTH * CIF_HEIGHT * 3 * 2;
+        err = ERR_UNKNOWN_FORMAT;
+        goto EXIT;
     }
 	
 	pf = fopen(fname, "rb");
@@ -892,98 +879,43 @@ int main(int argc, char *argv[])
 	file_size = 0;
 	fseek(pf, 0, SEEK_END);
 	file_size = ftell(pf);
-	if (file_size < CIF_FRAME_SIZE)
+	if (file_size < buf_size)
 	{
 		err = ERR_FILE_SIZE_MISMATCH;
 		goto EXIT;
 	}
 	fseek(pf, 0, SEEK_SET);
 	
-	pbuf = malloc(CIF_FRAME_SIZE);
+	pbuf = malloc(buf_size);
 	if (NULL == pbuf)
 	{
 		err = ERR_MEM_ALLOC_FAILED;
 		goto EXIT;
 	}
 	
-	i = fread(pbuf, 1, CIF_FRAME_SIZE, pf);
-	if (i != CIF_FRAME_SIZE)
+	i = fread(pbuf, 1, buf_size, pf);
+	if (i != buf_size)
 	{
 		err = ERR_FILE_READ_FAILED;
 		goto EXIT;
 	}
-	
-	if (CIF_FORMAT == FMT_YUV422I)
-	{
-		for (i = 0; i < MAX_PLAN; i++)
-		{
-			frame[i].buf = i == 0 ? pbuf : i == 1 ? pbuf + 1 : pbuf + 3;
-			frame[i].w = i == 0 ? CIF_WIDTH : CIF_WIDTH / 2;
-			frame[i].h = CIF_HEIGHT;
-			frame[i].pitch = CIF_WIDTH * 2;
-			frame[i].inter = i == 0 ? 2 : 4;
-			frame[i].x_ds = i == 0 ? 0 : 1;
-			frame[i].y_ds = 0;
-            frame[i].sample = 8;
-		}
-	}
-	else if (CIF_FORMAT == FMT_YUV422P)
-	{
-		for (i = 0; i < MAX_PLAN; i++)
-		{
-			frame[i].buf = i == 0 ? pbuf : i == 1 ? pbuf + CIF_WIDTH * CIF_HEIGHT : pbuf + CIF_WIDTH * CIF_HEIGHT * 3 / 2;
-			frame[i].w = i == 0 ? CIF_WIDTH : CIF_WIDTH / 2;
-			frame[i].h = CIF_HEIGHT;
-			frame[i].pitch = i == 0 ? CIF_WIDTH : CIF_WIDTH / 2;
-			frame[i].inter = 1;
-			frame[i].x_ds = i == 0 ? 0 : 1;
-			frame[i].y_ds = 0;
-            frame[i].sample = 8;
-		}
-	}
-	else if (CIF_FORMAT == FMT_YUV420P)
-	{
-		for (i = 0; i < MAX_PLAN; i++)
-		{
-			frame[i].buf = i == 0 ? pbuf : i == 1 ? pbuf + CIF_WIDTH * CIF_HEIGHT : pbuf + CIF_WIDTH * CIF_HEIGHT * 5 / 4;
-			frame[i].w = i == 0 ? CIF_WIDTH : CIF_WIDTH / 2;
-			frame[i].h = i == 0 ? CIF_HEIGHT : CIF_HEIGHT / 2;
-			frame[i].pitch = i == 0 ? CIF_WIDTH : CIF_WIDTH / 2;
-			frame[i].inter = 1;
-			frame[i].x_ds = i == 0 ? 0 : 1;
-			frame[i].y_ds = i == 0 ? 0 : 1;
-            frame[i].sample = 8;
-		}
-	}
-	else if (CIF_FORMAT == FMT_YUV420SP)
-	{
-		for (i = 0; i < MAX_PLAN; i++)
-		{
-			frame[i].buf = i == 0 ? pbuf : i == 1 ? pbuf + CIF_WIDTH * CIF_HEIGHT : pbuf + CIF_WIDTH * CIF_HEIGHT + 1;
-			frame[i].w = i == 0 ? CIF_WIDTH : CIF_WIDTH / 2;
-			frame[i].h = i == 0 ? CIF_HEIGHT : CIF_HEIGHT / 2;
-			frame[i].pitch = CIF_WIDTH;
-			frame[i].inter = i == 0 ? 1 : 2;
-			frame[i].x_ds = i == 0 ? 0 : 1;
-			frame[i].y_ds = i == 0 ? 0 : 1;
-            frame[i].sample = 8;
-		}
-	}
-    else if (CIF_FORMAT == FMT_RGBI_FP16)
+
+    i = fmt_init_frame_info(CIF_FORMAT, CIF_WIDTH, CIF_HEIGHT, pbuf, buf_size, &frameInfo);
+    if (i < 0)
     {
-        for (i = 0; i < MAX_PLAN; i++)
-		{
-			frame[i].buf = i == 0 ? pbuf : i == 1 ? pbuf + 2 : pbuf + 4;
-			frame[i].w = CIF_WIDTH;
-			frame[i].h = CIF_HEIGHT;
-			frame[i].pitch = CIF_WIDTH * 3 * 2;
-			frame[i].inter = 6;
-			frame[i].x_ds = 0;
-			frame[i].y_ds = 0;
-            frame[i].sample = 0x10000 | 16;
-		}
+        err = ERR_UNKNOWN_FORMAT;
+        goto EXIT;
     }
-	
+
+    if (CIF_OUTPUT)
+    {
+        err = dump();
+        //if (err)
+        {
+            goto EXIT;
+        }
+    }
+    
 	err = RDWIN_Init(MODE_1);
     if (err)
     {
@@ -1080,6 +1012,10 @@ int main(int argc, char *argv[])
 	}
 	
 EXIT:
+    if (err)
+    {
+        printf("Error: %d\n", err);
+    }
 	if (pbuf) {
 		free(pbuf);
 	}
