@@ -19,6 +19,10 @@ typedef enum
     FMT_BGRI_U8 = 17,
     FMT_RGBI_FP16 = 18,
     FMT_BGRI_FP16 = 19,
+    FMT_RGB_U8 = 24,
+    FMT_BGR_U8 = 25,
+    FMT_RGB_FP16 = 26,
+    FMT_BGR_FP16 = 27,
     FMT_MAX = 0x7fffffff
 } FMT_ID;
 
@@ -181,6 +185,38 @@ static FMT_DESC fmt_table[] = {
         {0, 0, 0},
         {0, 0, 0},
     },
+    {FMT_RGB_U8, CS_RGB, 3, BPP_X3, 8, 0,
+        {STAGE_X0, STAGE_X1, STAGE_X2},
+        {0, 0, 0},
+        {PITCH_X1, PITCH_X1, PITCH_X1},
+        {1, 1, 1},
+        {0, 0, 0},
+        {0, 0, 0},
+    },
+    {FMT_BGR_U8, CS_RGB, 3, BPP_X3, 8, 0,
+        {STAGE_X2, STAGE_X1, STAGE_X0},
+        {0, 0, 0},
+        {PITCH_X1, PITCH_X1, PITCH_X1},
+        {1, 1, 1},
+        {0, 0, 0},
+        {0, 0, 0},
+    },
+    {FMT_RGB_FP16, CS_RGB, 3, BPP_X6, 16, 1,
+        {STAGE_X0, STAGE_X2, STAGE_X4},
+        {0, 0, 0},
+        {PITCH_X2, PITCH_X2, PITCH_X2},
+        {2, 2, 2},
+        {0, 0, 0},
+        {0, 0, 0},
+    },
+    {FMT_BGR_FP16, CS_RGB, 3, BPP_X6, 16, 1,
+        {STAGE_X4, STAGE_X2, STAGE_X0},
+        {0, 0, 0},
+        {PITCH_X2, PITCH_X2, PITCH_X2},
+        {2, 2, 2},
+        {0, 0, 0},
+        {0, 0, 0},
+    },
     {FMT_MAX}
 };
 
@@ -195,6 +231,10 @@ static FMT_NAME name_table[] = {
     {"bgriu8", FMT_BGRI_U8},
     {"rgbifp16", FMT_RGBI_FP16},
     {"bgrifp16", FMT_BGRI_FP16},
+    {"rgbu8",  FMT_RGB_U8},
+    {"bgru8",  FMT_BGR_U8},
+    {"rgbfp16",  FMT_RGB_FP16},
+    {"bgrfp16",  FMT_BGR_FP16},
     {NULL}
 };
 
